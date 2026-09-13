@@ -1,15 +1,14 @@
-import os
 import base64
+import os
+
 import requests
 
 
-OWNER = os.environ["GITHUB_OWNER"]
-REPO = os.environ["GITHUB_REPO"]
-
-HEADERS = {
-    "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-    "Accept": "application/vnd.github+json",
-}
+def _headers() -> dict:
+    return {
+        "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+        "Accept": "application/vnd.github+json",
+    }
 
 
 def search_repo(query: str) -> dict:
@@ -25,12 +24,12 @@ def search_repo(query: str) -> dict:
 
     response = requests.get(
         "https://api.github.com/search/code",
-        headers=HEADERS,
+        headers=_headers(),
         params={
-            "q": f"{query} repo:{OWNER}/{REPO}",
+            "q": f"{query} repo:{os.environ['GITHUB_OWNER']}/{os.environ['GITHUB_REPO']}",
             "per_page": 10,
         },
-        timeout=15,
+        timeout=(5, 10),
     )
 
     response.raise_for_status()
@@ -58,14 +57,19 @@ def read_file(path: str) -> dict:
 
     response = requests.get(
         f"https://api.github.com/repos/"
-        f"{OWNER}/{REPO}/contents/{path}",
-        headers=HEADERS,
-        timeout=15,
+        f"{os.environ['GITHUB_OWNER']}/{os.environ['GITHUB_REPO']}/contents/{path}",
+        headers=_headers(),
+        timeout=(5, 10),
     )
 
     response.raise_for_status()
 
     data = response.json()
+
+    if not isinstance(data, dict) or data.get("type") != "file":
+        raise ValueError("The requested path is not a file")
+    if data.get("encoding") != "base64" or "content" not in data:
+        raise ValueError("GitHub did not return readable file contents")
 
     contents = base64.b64decode(
         data["content"]
@@ -78,4 +82,5 @@ def read_file(path: str) -> dict:
         "path": path,
         "url": data["html_url"],
         "content": contents[:50_000],
+        "truncated": len(contents) > 50_000,
     }

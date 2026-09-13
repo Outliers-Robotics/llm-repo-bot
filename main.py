@@ -1,5 +1,7 @@
+import logging
 import os
 import re
+from time import monotonic
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -8,20 +10,15 @@ from llm.factory import get_llm
 from prompts.system import SYSTEM_PROMPT
 from tools.github import search_repo, read_file
 
-app = App(
-    token=os.environ["SLACK_BOT_TOKEN"]
-)
-
-llm = get_llm()
-
 TOOLS = [
     search_repo,
     read_file,
 ]
 
 
-@app.event("app_mention")
-def handle_mention(event, say):
+def handle_mention(event, say, client, logger, llm):
+    if event.get("bot_id") or event.get("subtype") == "bot_message":
+        return
 
     question = re.sub(
         r"<@[^>]+>",
@@ -32,31 +29,72 @@ def handle_mention(event, say):
     if not question:
         return
 
+    started = monotonic()
+    thread_ts = event.get("thread_ts") or event["ts"]
+    pending = None
+    try:
+        pending = say(
+            text="I'm looking into that…",
+            thread_ts=thread_ts,
+        )
+    except Exception:
+        logger.exception("Could not post the Slack status message")
+
     try:
         answer = llm.answer(
             question=question,
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
         )
+        if not isinstance(answer, str) or not answer.strip():
+            raise RuntimeError("The model did not return a non-empty answer")
+        answer = answer.strip()
 
-    except Exception as error:
-        print(error)
+    except Exception:
+        logger.exception("Could not answer Slack mention ts=%s", event["ts"])
         answer = (
             "I couldn't complete that request. "
-            "Check the bot logs."
+            "Please try again or ask a more specific question."
         )
 
-    say(
-        answer,
-        thread_ts=event.get(
-            "thread_ts",
-            event["ts"],
-        ),
-    )
+    try:
+        if pending is not None:
+            try:
+                client.chat_update(
+                    channel=event["channel"],
+                    ts=pending["ts"],
+                    text=answer,
+                )
+                return
+            except Exception:
+                logger.exception("Could not update Slack status; posting the answer separately")
+        say(text=answer, thread_ts=thread_ts)
+    except Exception:
+        logger.exception("Could not deliver the Slack answer ts=%s", event["ts"])
+    finally:
+        logger.info(
+            "Slack mention ts=%s elapsed=%.2fs", event["ts"], monotonic() - started,
+        )
+
+
+def create_app():
+    # Initialize network clients at startup, not when importing a listener.
+    app = App(token=os.environ["SLACK_BOT_TOKEN"])
+    llm = get_llm()
+
+    @app.event("app_mention")
+    def mention_listener(event, say, client, logger):
+        handle_mention(event, say, client, logger, llm)
+
+    return app
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     SocketModeHandler(
-        app,
+        create_app(),
         os.environ["SLACK_APP_TOKEN"],
     ).start()
