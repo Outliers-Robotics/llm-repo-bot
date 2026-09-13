@@ -117,3 +117,128 @@ class PlotTests(unittest.TestCase):
         self.assertEqual(result["status"], "graph_ready")
         self.assertEqual(len(self.session.artifacts), 1)
         self.assertEqual(len(result["series"][0]["points"]), 3)
+
+    def test_plot_data_with_points_list(self):
+        result = self.session.plot_data(
+            title="Velocity Profile",
+            x_label="Time (s)",
+            y_label="Velocity (m/s)",
+            series=[
+                {
+                    "label": "Trapezoidal",
+                    "points": [[2.0, 4.0], [0.0, 0.0], [1.0, 2.0], [3.0, 4.0]],
+                    "source": "MotionProfile.cpp",
+                }
+            ],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        self.assertEqual(len(self.session.artifacts), 1)
+        self.assertEqual(
+            result["series"][0]["points"],
+            [(0.0, 0.0), (1.0, 2.0), (2.0, 4.0), (3.0, 4.0)],
+        )
+        self.assertEqual(result["series"][0]["source"], "MotionProfile.cpp")
+        self.assertTrue(self.session.artifacts[0].png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn("Trapezoidal: 4 points", self.session.artifacts[0].alt_text)
+
+    def test_plot_data_with_x_and_y_lists(self):
+        result = self.session.plot_data(
+            title="Polynomial Fit",
+            x_label="X",
+            y_label="Y",
+            series=[
+                {
+                    "label": "Quadratic",
+                    "x": [1, 2, 3, 4],
+                    "y": [1, 4, 9, 16],
+                    "source": "y = x^2",
+                }
+            ],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        self.assertEqual(len(self.session.artifacts), 1)
+        self.assertEqual(
+            result["series"][0]["points"],
+            [(1.0, 1.0), (2.0, 4.0), (3.0, 9.0), (4.0, 16.0)],
+        )
+
+    def test_plot_data_with_multiple_series(self):
+        result = self.session.plot_data(
+            title="Shooter Comparison",
+            x_label="Distance (m)",
+            y_label="Flywheel (RPM)",
+            series=[
+                {"label": "High Goal", "points": [[1.0, 1000.0], [2.0, 1500.0], [3.0, 2000.0]]},
+                {"label": "Low Goal", "points": [[1.0, 800.0], [2.0, 1200.0], [3.0, 1600.0]]},
+            ],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        self.assertEqual(len(result["series"]), 2)
+        self.assertEqual(len(self.session.artifacts), 1)
+        self.assertIn("High Goal: 3 points", self.session.artifacts[0].alt_text)
+        self.assertIn("Low Goal: 3 points", self.session.artifacts[0].alt_text)
+
+    def test_plot_data_direct_points_parameter(self):
+        result = self.session.plot_data(
+            title="Direct Curve",
+            x_label="Time (s)",
+            y_label="Value",
+            points=[[0, 10], [1, 20], [2, 30]],
+            labels=["Custom Curve"],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        self.assertEqual(result["series"][0]["label"], "Custom Curve")
+        self.assertEqual(result["series"][0]["points"], [(0.0, 10.0), (1.0, 20.0), (2.0, 30.0)])
+
+    def test_plot_data_delegates_to_plot_lookup_tables_when_given_paths_and_tables(self):
+        self.session.read_file("Shot.cpp")
+        result = self.session.plot_data(
+            title="Delegated Lookup",
+            x_label="Distance (m)",
+            y_label="Speed (RPM)",
+            paths=["Shot.cpp"],
+            tables=["flyMap"],
+            labels=["Flywheel"],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        self.assertEqual(result["series"][0]["points"], [(1, 1230), (2, 1330), (3, 1675)])
+
+    def test_plot_lookup_tables_delegates_to_plot_data_when_given_series(self):
+        result = self.session.plot_lookup_tables(
+            title="Delegated Data",
+            x_label="X",
+            y_label="Y",
+            series=[{"label": "Curve", "points": [[1, 2], [2, 4], [3, 6]]}],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        self.assertEqual(result["series"][0]["points"], [(1.0, 2.0), (2.0, 4.0), (3.0, 6.0)])
+
+    def test_plot_data_validation_errors(self):
+        # Missing data
+        self.assertIn("Provide at least one data series", self.session.plot_data("T", "X", "Y")["error"])
+
+        # Too many series (> 6)
+        many_series = [{"label": f"S{i}", "points": [[0, 0], [1, 1]]} for i in range(7)]
+        self.assertIn("Provide 1–6 data series", self.session.plot_data("T", "X", "Y", series=many_series)["error"])
+
+        # Fewer than 2 points
+        self.assertIn("between 2 and 500 points", self.session.plot_data("T", "X", "Y", series=[{"label": "S", "points": [[0, 0]]}])["error"])
+
+        # Greater than 500 points
+        huge_points = [[i, i] for i in range(501)]
+        self.assertIn("between 2 and 500 points", self.session.plot_data("T", "X", "Y", series=[{"label": "S", "points": huge_points}])["error"])
+
+        # Mismatched x and y lists
+        self.assertIn("must have the same length", self.session.plot_data("T", "X", "Y", series=[{"label": "S", "x": [1, 2], "y": [1]}])["error"])
+
+        # Non-numeric point values
+        self.assertIn("non-numeric", self.session.plot_data("T", "X", "Y", series=[{"label": "S", "points": [[1, "abc"], [2, 3]]}])["error"])
+
+        # Non-finite values (inf / nan)
+        self.assertIn("finite numbers", self.session.plot_data("T", "X", "Y", series=[{"label": "S", "points": [[1, float("nan")], [2, 3]]}])["error"])
+
+        # Exceeding magnitude 1e12
+        self.assertIn("cannot exceed 1e12", self.session.plot_data("T", "X", "Y", series=[{"label": "S", "points": [[1, 1e13], [2, 3]]}])["error"])
+
+        # Point not [x, y] pair
+        self.assertIn("must be an [x, y] pair", self.session.plot_data("T", "X", "Y", series=[{"label": "S", "points": [[1], [2, 3]]}])["error"])

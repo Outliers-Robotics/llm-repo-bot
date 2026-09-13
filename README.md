@@ -47,34 +47,36 @@ The bot automatically:
 - Cleans bot mentions and maps roles between user turns and assistant responses.
 - Normalizes turns to ensure valid alternating conversation flows for underlying LLMs.
 
-## Graphs from lookup tables
+## Graphs and Visualizations (Lookup Tables & General Data)
 
-Ask, for example:
+The bot supports two plotting tools that render high-resolution PNG charts directly into the Slack thread:
 
-> @OutliersLLM-Bot Graph the flywheel RPM lookup table against distance.
+1. **`plot_lookup_tables` (Repository C++ Tables)**:
+   Extracts named brace-initialized `{x, y}` lookup tables from C++ files read during repository research (such as flywheel speed tables, hood angle maps, or arm position targets).
 
-> @OutliersLLM-Bot Compare the RPM lookup tables in these files on one graph: …
+   Ask, for example:
+   > @OutliersLLM-Bot Graph the flywheel RPM lookup table against distance.
+   > @OutliersLLM-Bot Compare the RPM lookup tables in these files on one graph: …
 
-The bot reads the C++ source, renders a PNG with Matplotlib, and attaches it in
-the same Slack thread. Graphs include labeled axes, a legend, and source paths;
-the text answer includes source links. Multiple tables with matching units can
-share one chart; different quantities use separate charts.
+2. **`plot_data` (Arbitrary Equations, Trajectories, and Computed Curves)**:
+   Plots arbitrary mathematical functions, kinematic trajectories, motion profiles, PID controller responses, polynomial fits, or computed data series without requiring static C++ lookup tables in repo code.
+
+   Ask, for example:
+   > @OutliersLLM-Bot Plot the ballistic trajectory for a shot at 45 degrees with 12 m/s muzzle velocity.
+   > @OutliersLLM-Bot Plot a trapezoidal motion profile for a 2 meter arm movement.
+   > @OutliersLLM-Bot Graph y = x^2 and compare it with the quadratic regression of our shooter data.
+
+The bot renders PNG charts locally with Matplotlib and attaches them in the same Slack thread using `files_upload_v2`. Graphs feature clean typography, labeled axes with units, subtle grid lines, legends, and source provenance notes.
 
 For an existing Slack installation, add **`files:write`** under **OAuth &
 Permissions → Bot Token Scopes**, then **reinstall the app to the workspace**.
-Rebuild/restart the bot to install the new Python dependency. A missing upload
-scope produces an explanation in the reply while preserving the text answer.
+A missing upload scope produces an explanation in the reply while preserving the text answer.
 
-The plotting tool selects named brace-initialized `{x, y}` tables from files
-read during that request. Values are extracted locally, including basic
-arithmetic and unambiguous preceding scalar definitions such as `rpmBumpLow`.
-This is a limited static reader, not a C++ compiler: function calls, unit
-wrappers, preprocessor-dependent definitions, runtime values, and complex
-initializers are unsupported. It refuses ambiguous or incomplete data instead
-of fabricating points. Source points are marked; connecting lines are visual
-guides, not a claim about the robot's interpolation or runtime behavior.
-Each request supports up to three graphs, six tables per graph, and 500 points
-per table. Rendering runs locally, and source data is not sent to a chart service.
+### Plotting Rules and Safeguards
+- **Lookup Tables**: Values are extracted locally from source, including basic arithmetic and unambiguous preceding scalar definitions (e.g. `rpmBumpLow`). Function calls, unit wrappers, preprocessor conditionals, runtime data, and complex initializers are unsupported to avoid fabricating inaccurate points.
+- **Computed Curves**: Provide 1–6 data series with 2 to 500 points each (finite numbers $\le 10^{12}$). Points are automatically sorted by X.
+- **Attachment Budget**: Each answer supports up to three graph attachments.
+- **Local Rendering**: Chart generation runs entirely locally inside the bot process; source data and coordinates are never sent to external chart APIs or cloud rendering services.
 
 ## Repository research
 

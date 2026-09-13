@@ -157,6 +157,27 @@ class MentionTests(unittest.TestCase):
         self.assertIn("Flywheel: 2 points", upload["alt_txt"])
         self.assertIn("configured RPM", self.client.chat_update.call_args.kwargs["markdown_text"])
 
+    def _answer_with_data_plot(self, **kwargs):
+        functions = {tool.__name__: tool for tool in kwargs["tools"]}
+        result = functions["plot_data"](
+            title="Kinematic Curve", x_label="Time (s)", y_label="Speed (m/s)",
+            series=[{"label": "Profile", "points": [[0, 0], [1, 2], [2, 4]], "source": "Physics"}],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        return "The graph shows the kinematic curve."
+
+    def test_plot_data_is_uploaded_as_png_in_the_existing_thread(self):
+        self.event["thread_ts"] = "0.5"
+        self.llm.answer.side_effect = self._answer_with_data_plot
+        self.handle()
+        upload = self.client.files_upload_v2.call_args.kwargs
+        self.assertEqual(upload["channel"], "C1")
+        self.assertEqual(upload["thread_ts"], "0.5")
+        self.assertTrue(upload["file"].startswith(b"\x89PNG"))
+        self.assertEqual(upload["filename"], "plot-1.png")
+        self.assertIn("Profile: 3 points", upload["alt_txt"])
+        self.assertIn("kinematic curve", self.client.chat_update.call_args.kwargs["markdown_text"])
+
     def test_graph_upload_failure_preserves_text_and_explains_missing_scope(self):
         self.llm.answer.side_effect = self._answer_with_graph
         self.client.files_upload_v2.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})

@@ -184,10 +184,17 @@ class GeminiChatSession(ProviderSession):
         else:
             message = (
                 "Repository research is complete. If the source supports the "
-                "requested graph, call plot_lookup_tables now."
+                "requested graph, call plot_lookup_tables or plot_data now."
             )
+        plot_tools = [
+            self.function_map[name]
+            for name in ("plot_lookup_tables", "plot_data")
+            if name in self.function_map
+        ]
+        if not plot_tools:
+            plot_tools = [tool for name, tool in self.function_map.items() if "plot" in name]
         plot_config = self.base_config.model_copy(update={
-            "tools": [self.function_map["plot_lookup_tables"]],
+            "tools": plot_tools,
             "system_instruction": system_prompt + GRAPH_TURN_INSTRUCTION,
         })
         started = monotonic()

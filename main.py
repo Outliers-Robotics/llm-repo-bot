@@ -281,7 +281,7 @@ def handle_mention(
         answer = llm.answer(
             question=question,
             system_prompt=SYSTEM_PROMPT,
-            tools=[search_repo, plots.read_file, plots.plot_lookup_tables],
+            tools=[search_repo, plots.read_file, plots.plot_lookup_tables, plots.plot_data],
             history=history,
         )
         if not isinstance(answer, str) or not answer.strip():

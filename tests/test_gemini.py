@@ -419,6 +419,30 @@ class GeminiProviderTests(unittest.TestCase):
         self.assertEqual(len(session.artifacts), 1)
         self.assertEqual(session.artifacts[0].filename, "lookup-tables-1.png")
 
+    def test_plot_data_called_during_graph_turn(self):
+        session = PlotSession(lambda path: {"content": ""})
+        self.responses.extend([
+            model_response({"text": "I will plot the mathematical trajectory."}),
+            model_response(tool_call(
+                "plot_data",
+                title="Ballistic Trajectory",
+                x_label="Distance (m)",
+                y_label="Height (m)",
+                series=[{"label": "Arc", "points": [[0, 0], [1, 2], [2, 0]], "source": "Physics formula"}],
+            )),
+            model_response({"text": "The trajectory graph is generated."}),
+        ])
+        answer = self.provider.answer(
+            question="Plot the ballistic trajectory curve",
+            system_prompt="Use physics.",
+            tools=[session.read_file, session.plot_lookup_tables, session.plot_data],
+        )
+        self.assertIn("The trajectory graph is generated.", answer)
+        self.assertEqual(len(session.artifacts), 1)
+        self.assertEqual(session.artifacts[0].filename, "plot-1.png")
+        declarations = [d["name"] for tool in self.requests[1]["tools"] for d in tool["functionDeclarations"]]
+        self.assertEqual(declarations, ["plot_lookup_tables", "plot_data"])
+
     def test_history_is_passed_to_chat_session_as_model_and_user_turns(self):
         self.responses.append(model_response({"text": "The ratio is 6.75:1."}))
         answer = self.provider.answer(

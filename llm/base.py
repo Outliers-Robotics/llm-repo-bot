@@ -28,8 +28,8 @@ lookup budgets or tool-call limits to the user.
 
 GRAPH_TURN_INSTRUCTION = (
     "\nRepository research is complete. If the source supports the "
-    "requested graph, call plot_lookup_tables now. Only that tool "
-    "is available. Otherwise explain the missing evidence."
+    "requested graph, call plot_lookup_tables or plot_data now. Only plotting tools "
+    "are available. Otherwise explain the missing evidence."
 )
 
 INCOMPLETE_ANSWER = (
@@ -105,16 +105,18 @@ def should_take_graph_turn(
     function_map: dict[str, Callable],
 ) -> bool:
     """Check whether a dedicated graph rendering turn is warranted."""
-    return (
-        "plot_lookup_tables" in function_map
-        and is_graph_request(question)
-        and any(item["tool"] == "read_file" and "result" in item for item in evidence)
-        and not any(
-            item["tool"] == "plot_lookup_tables"
-            and item.get("result", {}).get("status") == "graph_ready"
-            for item in evidence
-        )
-    )
+    has_plot_tool = "plot_lookup_tables" in function_map or "plot_data" in function_map
+    if not has_plot_tool or not is_graph_request(question):
+        return False
+    if any(
+        item["tool"] in ("plot_lookup_tables", "plot_data")
+        and item.get("result", {}).get("status") == "graph_ready"
+        for item in evidence
+    ):
+        return False
+    if "plot_data" in function_map:
+        return True
+    return any(item["tool"] == "read_file" and "result" in item for item in evidence)
 
 
 def normalize_history(
@@ -361,7 +363,11 @@ class BaseResearchProvider(LLMProvider):
                     if turn.text:
                         return turn.text
                 else:
-                    plot_map = {"plot_lookup_tables": function_map["plot_lookup_tables"]}
+                    plot_map = {
+                        name: function_map[name]
+                        for name in ("plot_lookup_tables", "plot_data")
+                        if name in function_map
+                    }
                     for call in calls[:3]:
                         res = execute_tool(call, plot_map, None, self.logger)
                         evidence.append({"tool": call.name, "arguments": call.args or {}, **res})
