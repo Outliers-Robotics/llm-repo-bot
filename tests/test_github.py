@@ -19,9 +19,9 @@ class GitHubToolTests(unittest.TestCase):
 
     def test_search_is_repo_scoped_and_has_network_timeouts(self):
         self.response.json.return_value = {
-            "items": [{"path": "Robot.java", "html_url": "https://github.com/team/robot/Robot.java"}],
+            "items": [{"path": "Robot.cpp", "html_url": "https://github.com/team/robot/Robot.cpp"}],
         }
-        self.assertEqual(search_repo("Drive")["matches"][0]["path"], "Robot.java")
+        self.assertEqual(search_repo("Drive")["matches"][0]["path"], "Robot.cpp")
         self.assertEqual(self.get.call_args.kwargs["params"]["q"], "Drive repo:team/robot")
         self.assertEqual(self.get.call_args.kwargs["timeout"], (5, 10))
 
@@ -30,12 +30,25 @@ class GitHubToolTests(unittest.TestCase):
             with self.subTest(length=length):
                 self.response.json.return_value = {
                     "type": "file", "encoding": "base64",
-                    "html_url": "https://github.com/team/robot/Robot.java",
+                    "html_url": "https://github.com/team/robot/Robot.cpp",
                     "content": base64.b64encode(b"a" * length).decode(),
                 }
-                result = read_file("Robot.java")
+                result = read_file("Robot.cpp")
                 self.assertEqual(result["content"], "a" * min(length, 50_000))
                 self.assertEqual(result["truncated"], length > 50_000)
+
+    def test_search_reports_result_counts_and_next_step(self):
+        for items in ([], [{"path": "Shooter.cpp", "html_url": "https://github.com/team/robot/Shooter.cpp"}]):
+            with self.subTest(items=items):
+                self.response.json.return_value = {
+                    "items": items, "total_count": len(items), "incomplete_results": False,
+                }
+                with self.assertLogs("tools.github", level="INFO") as logs:
+                    result = search_repo("shooter")
+                self.assertEqual(result["total_count"], len(items))
+                self.assertFalse(result["incomplete_results"])
+                self.assertIn(f"matches={len(items)}", logs.output[0])
+                self.assertIn("Read" if items else "No matches", result["next_step"])
 
     def test_directory_and_unsupported_file_are_reported(self):
         for data in ([], {"type": "file", "encoding": "none", "content": ""}):

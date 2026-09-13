@@ -24,11 +24,20 @@ acknowledges mention events before running the listener in its worker pool.
 
 Independent repository lookups in one model response run concurrently, with
 up to four workers per mention. Each answer allows up to four tool rounds and
-twelve tool calls, then reserves one final model request with function calling
-disabled. All tool results remain in the chat history, including errors and
-results from the last permitted round. Intermediate model text accompanying a
-tool call is not used as the answer. Empty, blocked, and failed model responses
-become a readable Slack error.
+twelve distinct tool calls. Identical lookups reuse their results within a
+request; a round that only repeats previous lookups ends research early.
+After a search finds files, the next research turn offers `read_file` with the
+exact matching paths as permitted choices. Invented paths are rejected before
+calling GitHub. Both repository tools become available again after a successful
+read. The repository uses C++; code questions
+need evidence from relevant headers, implementations, and referenced constants.
+When research ends, one fresh model request receives the original question and
+all executed lookup results as text, including errors and the last round's
+results. That final request has no tool declarations or function-call history.
+If it still requests a tool, returns no text, or fails, the bot asks for a more
+specific class, file path, or method name. Intermediate text accompanying a
+tool call is not used as the answer. Tools remain enabled during research;
+no additional Slack or Gemini setting is needed to enable them.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -48,6 +57,8 @@ tools; code-specific answers still require repository evidence.
 
 Startup enables INFO logs. Each mention logs total elapsed time, each Gemini
 round logs model/round/duration, and each repository tool logs its duration.
+GitHub searches also log match counts and whether the results are incomplete,
+without logging search text or file contents.
 Failures include tracebacks. Compare these durations to see whether time is
 being spent in Gemini, GitHub, or Slack delivery.
 

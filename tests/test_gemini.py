@@ -8,7 +8,7 @@ from unittest.mock import patch
 import httpx
 from google import genai
 
-from llm.gemini import GeminiProvider
+from llm.gemini import GeminiProvider, INCOMPLETE_ANSWER
 
 
 def model_response(*parts):
@@ -82,36 +82,38 @@ class GeminiProviderTests(unittest.TestCase):
         self.assertEqual(self.http_options.retry_options.attempts, 2)
 
     def test_tool_only_response_is_executed_before_answering(self):
-        call = tool_call(path="Robot.java")
+        call = tool_call(path="Robot.cpp")
         call["functionCall"]["id"] = "call-1"
         call["thoughtSignature"] = "c2lnbmF0dXJl"
         self.responses.extend([
             model_response({"text": "I'll check the code."}, call),
-            model_response({"text": "Robot.java drives the robot."}),
+            model_response({"text": "Robot.cpp drives the robot."}),
         ])
-        self.assertEqual(self.answer(), "Robot.java drives the robot.")
+        self.assertEqual(self.answer(), "Robot.cpp drives the robot.")
         history = self.requests[1]["contents"]
         self.assertEqual(history[1]["parts"][1], call)
         result = history[2]["parts"][0]["functionResponse"]
         self.assertEqual(result["id"], "call-1")
-        self.assertEqual(result["response"]["result"]["path"], "Robot.java")
+        self.assertEqual(result["response"]["result"]["path"], "Robot.cpp")
 
     def test_round_limit_reserves_final_answer_with_all_results(self):
         for index in range(4):
-            self.responses.append(model_response(tool_call(path=f"File{index}.java")))
+            self.responses.append(model_response(tool_call(path=f"File{index}.cpp")))
         self.responses.append(model_response({"text": "Answer based on four files."}))
         self.assertEqual(self.answer(), "Answer based on four files.")
         self.assertEqual(len(self.requests), 5)
         final_request = self.requests[-1]
-        self.assertEqual(
-            final_request["toolConfig"]["functionCallingConfig"]["mode"], "NONE",
-        )
+        self.assertNotIn("tools", final_request)
+        self.assertNotIn("toolConfig", final_request)
+        self.assertEqual(len(final_request["contents"]), 1)
+        parts = final_request["contents"][0]["parts"]
+        self.assertEqual(list(parts[0]), ["text"])
+        evidence = json.loads(parts[0]["text"])
+        self.assertEqual(evidence["question"], "Explain the robot code")
         paths = [
-            part["functionResponse"]["response"]["result"]["path"]
-            for content in final_request["contents"] for part in content["parts"]
-            if "functionResponse" in part
+            lookup["result"]["path"] for lookup in evidence["repository_lookups"]
         ]
-        self.assertEqual(paths, [f"File{i}.java" for i in range(4)])
+        self.assertEqual(paths, [f"File{i}.cpp" for i in range(4)])
 
     def test_independent_tools_run_concurrently_in_original_order(self):
         barrier = Barrier(2, timeout=5)
@@ -147,12 +149,11 @@ class GeminiProviderTests(unittest.TestCase):
         self.assertEqual(self.answer(tools=[read]), "Partial answer.")
         self.assertEqual(len(called), 12)
         final_request = self.requests[1]
-        results = final_request["contents"][-1]["parts"]
-        self.assertEqual(len(results), 14)
-        self.assertIn("error", results[-1]["functionResponse"]["response"])
-        self.assertEqual(
-            final_request["toolConfig"]["functionCallingConfig"]["mode"], "NONE",
-        )
+        evidence = json.loads(final_request["contents"][0]["parts"][0]["text"])
+        results = evidence["repository_lookups"]
+        self.assertEqual(len(results), 12)
+        self.assertTrue(all("result" in result for result in results))
+        self.assertNotIn("tools", final_request)
 
     def test_unknown_tool_and_invalid_arguments_return_errors_to_model(self):
         self.responses.extend([
@@ -170,7 +171,7 @@ class GeminiProviderTests(unittest.TestCase):
             raise TimeoutError("GitHub did not respond")
 
         self.responses.extend([
-            model_response(tool_call("unavailable", path="Robot.java")),
+            model_response(tool_call("unavailable", path="Robot.cpp")),
             model_response({"text": "The repository lookup timed out."}),
         ])
         with self.assertLogs("llm.gemini", level="ERROR"):
@@ -211,12 +212,131 @@ class GeminiProviderTests(unittest.TestCase):
     def test_final_turn_does_not_execute_more_tools(self):
         self.provider.max_tool_rounds = 1
         self.responses.extend([
-            model_response(tool_call(path="Robot.java")),
-            model_response(tool_call(path="Other.java")),
+            model_response(tool_call(path="Robot.cpp")),
+            model_response(tool_call(path="Other.cpp")),
         ])
-        with self.assertRaisesRegex(RuntimeError, "final answer turn"):
-            self.answer()
+        with self.assertLogs("llm.gemini", level="WARNING"):
+            self.assertEqual(self.answer(), INCOMPLETE_ANSWER)
         self.assertEqual(len(self.requests), 2)
+
+    def test_four_searches_then_unexpected_tool_request_returns_readable_fallback(self):
+        def search_repo(query: str) -> dict:
+            """Search for robot code."""
+            return {"matches": []}
+
+        self.responses.extend(
+            model_response(tool_call("search_repo", query=query))
+            for query in ("shooter current", "shooter motor", "shooter", "current limit")
+        )
+        self.responses.append(model_response(tool_call("read_file", path="Shooter.cpp")))
+        with self.assertLogs("llm.gemini", level="WARNING"):
+            answer = self.provider.answer(
+                question="What is the current shooter current limits for all motors?",
+                system_prompt="Use source code to verify motor current limits.",
+                tools=[search_repo],
+            )
+        self.assertEqual(answer, INCOMPLETE_ANSWER)
+        self.assertEqual(len(self.requests), 5)
+        final_request = self.requests[-1]
+        self.assertNotIn("tools", final_request)
+        evidence = json.loads(final_request["contents"][0]["parts"][0]["text"])
+        self.assertEqual(len(evidence["repository_lookups"]), 4)
+        self.assertTrue(all(item["result"]["matches"] == [] for item in evidence["repository_lookups"]))
+
+    def test_empty_or_failed_final_response_returns_readable_fallback(self):
+        self.provider.max_tool_rounds = 1
+        for responses in ([{}], [httpx.ReadTimeout("timeout"), httpx.ReadTimeout("retry timeout")]):
+            with self.subTest(responses=responses):
+                self.responses.append(model_response(tool_call(path="Robot.cpp")))
+                self.responses.extend(responses)
+                with self.assertLogs("llm.gemini", level="ERROR"):
+                    self.assertEqual(self.answer(), INCOMPLETE_ANSWER)
+
+    def test_duplicate_lookup_reuses_evidence_and_ends_search_loop_early(self):
+        called = []
+
+        def read(path: str) -> dict:
+            """Read a source file."""
+            called.append(path)
+            return {"path": path, "content": "source"}
+
+        self.responses.extend([
+            model_response(tool_call("read", path="A"), tool_call("read", path="A")),
+            model_response(tool_call("read", path="A")),
+            model_response({"text": "Answer from file A."}),
+        ])
+        self.assertEqual(self.answer(tools=[read]), "Answer from file A.")
+        self.assertEqual(called, ["A"])
+        # Both initial calls get responses, but only one lookup was executed.
+        self.assertEqual(len(self.requests[1]["contents"][-1]["parts"]), 2)
+        self.assertEqual(len(self.requests), 3)
+        evidence = json.loads(self.requests[-1]["contents"][0]["parts"][0]["text"])
+        self.assertEqual(len(evidence["repository_lookups"]), 1)
+
+    def test_shooter_question_can_search_and_read_source_with_tools_enabled(self):
+        def search_repo(query: str) -> dict:
+            """Search for robot code."""
+            return {"matches": [{"path": "Shooter.cpp"}]}
+
+        def read_file(path: str) -> dict:
+            """Read a source file."""
+            return {"path": path, "content": "// Synthetic fixture, not real robot settings\nlimit = 25;"}
+
+        self.responses.extend([
+            model_response(tool_call("search_repo", query="shooter")),
+            model_response(tool_call("read_file", path="Shooter.cpp")),
+            model_response({"text": "The fixture sets the current limit to 25 A."}),
+        ])
+        answer = self.provider.answer(
+            question="What is the current shooter current limits for all motors?",
+            system_prompt="Use source code to verify motor current limits.",
+            tools=[search_repo, read_file],
+        )
+        self.assertIn("25 A", answer)
+        self.assertTrue(all(request["tools"] for request in self.requests))
+        read_request = self.requests[1]
+        self.assertEqual(
+            [declaration["name"] for tool in read_request["tools"]
+             for declaration in tool["functionDeclarations"]],
+            ["read_file"],
+        )
+        self.assertEqual(
+            read_request["toolConfig"]["functionCallingConfig"],
+            {"mode": "ANY", "allowedFunctionNames": ["read_file"]},
+        )
+        declaration = read_request["tools"][0]["functionDeclarations"][0]
+        self.assertEqual(declaration["parameters"]["properties"]["path"]["enum"], ["Shooter.cpp"])
+        self.assertNotIn("toolConfig", self.requests[2])
+        last_result = self.requests[-1]["contents"][-1]["parts"][0]["functionResponse"]
+        self.assertEqual(last_result["name"], "read_file")
+        self.assertIn("limit = 25", last_result["response"]["result"]["content"])
+
+    def test_read_step_rejects_invented_paths_and_can_recover(self):
+        paths_read = []
+
+        def search_repo(query: str) -> dict:
+            """Search robot code."""
+            return {"matches": [{"path": "src/subsystem/flywheel/FlywheelConstants.h"}]}
+
+        def read_file(path: str) -> dict:
+            """Read robot code."""
+            paths_read.append(path)
+            return {"path": path, "content": "source"}
+
+        actual_path = "src/subsystem/flywheel/FlywheelConstants.h"
+        self.responses.extend([
+            model_response(tool_call("search_repo", query="shooter")),
+            model_response(tool_call("read_file", path="src/subsystems/Shooter.h")),
+            model_response(tool_call("read_file", path=actual_path)),
+            model_response({"text": "Answer from the actual source."}),
+        ])
+        self.assertEqual(self.answer(tools=[search_repo, read_file]), "Answer from the actual source.")
+        self.assertEqual(paths_read, [actual_path])
+        error = self.requests[2]["contents"][-1]["parts"][0]["functionResponse"]["response"]
+        self.assertIn("error", error)
+        self.assertEqual(error["available_paths"], [actual_path])
+        self.assertIn("toolConfig", self.requests[2])
+        self.assertNotIn("toolConfig", self.requests[3])
 
     def test_mentions_have_separate_chat_histories(self):
         self.responses.extend([

@@ -1,7 +1,11 @@
 import base64
+import logging
 import os
 
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 def _headers() -> dict:
@@ -16,7 +20,9 @@ def search_repo(query: str) -> dict:
 
     Args:
         query: Code, class, method, subsystem, constant,
-            or other term to search for.
+            or other term to search for. Use a short identifier or a
+            qualifier such as filename:Robot.h, not a natural-language
+            sentence. Read relevant matching paths before searching again.
 
     Returns:
         Matching files and their GitHub URLs.
@@ -34,14 +40,30 @@ def search_repo(query: str) -> dict:
 
     response.raise_for_status()
 
+    data = response.json()
+    matches = [
+        {
+            "path": item["path"],
+            "url": item["html_url"],
+        }
+        for item in data["items"]
+    ]
+    total_count = data.get("total_count", len(matches))
+    incomplete = data.get("incomplete_results", False)
+    logger.info(
+        "GitHub search matches=%d total=%d incomplete=%s",
+        len(matches), total_count, incomplete,
+    )
     return {
-        "matches": [
-            {
-                "path": item["path"],
-                "url": item["html_url"],
-            }
-            for item in response.json()["items"]
-        ]
+        "matches": matches,
+        "total_count": total_count,
+        "incomplete_results": incomplete,
+        "next_step": (
+            "Read the most relevant matching file paths before searching again."
+            if matches else
+            "No matches were returned. Try a shorter identifier or filename once; "
+            "if that also finds nothing, ask the user for a class or file path."
+        ),
     }
 
 
