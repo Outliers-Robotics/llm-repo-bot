@@ -116,7 +116,7 @@ class MentionTests(unittest.TestCase):
         self.say.side_effect = RuntimeError("Slack unavailable")
         self.handle()
         self.assertEqual(self.logger.exception.call_count, 2)
-        self.logger.info.assert_called_once()
+        self.assertEqual(self.logger.info.call_count, 2)
 
     def test_bare_mentions_and_bot_events_do_no_work(self):
         for change in ({"text": "<@BOT> "}, {"bot_id": "B1"}, {"subtype": "bot_message"}):
@@ -192,7 +192,7 @@ class MentionTests(unittest.TestCase):
             ],
         }
         self.handle()
-        self.client.conversations_replies.assert_called_once_with(channel="C1", ts="1.0", limit=20)
+        self.client.conversations_replies.assert_called_once_with(channel="C1", ts="1.0", limit=50)
         call_kwargs = self.llm.answer.call_args.kwargs
         self.assertEqual(call_kwargs["question"], "What gear ratio?")
         self.assertEqual(call_kwargs["history"], [
@@ -209,16 +209,46 @@ class MentionTests(unittest.TestCase):
         self.assertIn("The drivetrain moves the robot.", self.client.chat_update.call_args.kwargs["markdown_text"])
 
     def test_top_level_mention_does_not_call_conversations_replies(self):
+        # Prepopulate other thread cache entries in the same and different channels
+        THREAD_HISTORY_CACHE.append("C1:0.1", "user", "Old thread in C1")
+        THREAD_HISTORY_CACHE.append("C1:0.1", "assistant", "Old answer in C1")
+        THREAD_HISTORY_CACHE.append("C2:1.0", "user", "Old thread in C2")
         self.handle()
         self.client.conversations_replies.assert_not_called()
         self.assertEqual(self.llm.answer.call_args.kwargs["history"], [])
 
+    def test_top_level_mention_with_thread_ts_equal_ts_is_isolated(self):
+        THREAD_HISTORY_CACHE.append("C1:1.0", "user", "Prior conversation turn")
+        self.event = {"text": "<@BOT> Fresh top-level question", "ts": "1.0", "thread_ts": "1.0", "channel": "C1"}
+        self.handle()
+        self.client.conversations_replies.assert_not_called()
+        self.assertEqual(self.llm.answer.call_args.kwargs["history"], [])
+
+    def test_different_threads_in_same_channel_are_isolated(self):
+        # Thread A history
+        THREAD_HISTORY_CACHE.append("C1:10.0", "user", "Question in Thread A")
+        THREAD_HISTORY_CACHE.append("C1:10.0", "assistant", "Answer in Thread A")
+        # Thread B history
+        THREAD_HISTORY_CACHE.append("C1:20.0", "user", "Question in Thread B")
+        THREAD_HISTORY_CACHE.append("C1:20.0", "assistant", "Answer in Thread B")
+
+        # Follow-up in Thread B (falls back to cache)
+        self.event = {"text": "<@BOT> Followup in Thread B", "ts": "21.0", "thread_ts": "20.0", "channel": "C1"}
+        self.client.conversations_replies.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})
+        self.handle()
+
+        call_kwargs = self.llm.answer.call_args.kwargs
+        self.assertEqual(call_kwargs["history"], [
+            {"role": "user", "content": "Question in Thread B"},
+            {"role": "assistant", "content": "Answer in Thread B"},
+        ])
+
     def test_thread_history_falls_back_to_cache_when_slack_scope_missing(self):
-        # Turn 1: Top-level question answered and cached
+        # Turn 1: Top-level question answered and cached under C1:1.0
         self.event = {"text": "<@BOT> Write a drive command", "ts": "1.0", "channel": "C1"}
         self.llm.answer.return_value = "Here is SwerveDriveCommand.cpp"
         self.handle()
-        self.assertTrue(THREAD_HISTORY_CACHE.has("1.0"))
+        self.assertTrue(THREAD_HISTORY_CACHE.has("C1:1.0"))
 
         # Turn 2: Follow-up question in the same thread
         self.event = {"text": "<@BOT> Can you update the CAN IDs?", "ts": "2.0", "thread_ts": "1.0", "channel": "C1"}
@@ -228,7 +258,7 @@ class MentionTests(unittest.TestCase):
         self.client.chat_update.reset_mock()
 
         self.handle()
-        self.client.conversations_replies.assert_called_once_with(channel="C1", ts="1.0", limit=20)
+        self.client.conversations_replies.assert_called_once_with(channel="C1", ts="1.0", limit=50)
         call_kwargs = self.llm.answer.call_args.kwargs
         self.assertEqual(call_kwargs["question"], "Can you update the CAN IDs?")
         self.assertEqual(call_kwargs["history"], [
@@ -246,7 +276,17 @@ class MentionTests(unittest.TestCase):
         self.handle()
         answer_text = self.client.chat_update.call_args.kwargs["markdown_text"]
         self.assertIn("channels:history", answer_text)
+        self.assertNotIn("groups:history", answer_text)
+
+    def test_thread_history_missing_groups_history_scope_warns_private_channel(self):
+        self.event = {"text": "<@BOT> Follow up in private channel", "ts": "2.0", "thread_ts": "1.0", "channel": "C1"}
+        self.client.conversations_replies.side_effect = SlackApiError(
+            "missing scope", {"error": "missing_scope", "needed": "groups:history", "provided": "channels:history"},
+        )
+        self.handle()
+        answer_text = self.client.chat_update.call_args.kwargs["markdown_text"]
         self.assertIn("groups:history", answer_text)
+        self.assertIn("private channel", answer_text)
 
     def test_message_listener_handles_thread_reply_in_cached_thread_without_bot_mention(self):
         with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "GEMINI_API_KEY": "test-key"}):
@@ -257,9 +297,9 @@ class MentionTests(unittest.TestCase):
 
         self.assertIsNotNone(message_listener)
 
-        # Pre-populate cache for thread 1.0
-        THREAD_HISTORY_CACHE.append("1.0", "user", "Explain drive")
-        THREAD_HISTORY_CACHE.append("1.0", "assistant", "Drive uses 4 swerve modules.")
+        # Pre-populate cache for thread 1.0 in channel C1
+        THREAD_HISTORY_CACHE.append("C1:1.0", "user", "Explain drive")
+        THREAD_HISTORY_CACHE.append("C1:1.0", "assistant", "Drive uses 4 swerve modules.")
 
         # User replies in thread 1.0 WITHOUT @mention
         reply_event = {

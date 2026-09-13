@@ -8,9 +8,9 @@ repository using Gemini and read-only GitHub tools.
 1. Install Python 3.10+ and `uv`, then run `uv sync --locked`.
 2. Copy `.env.example` to `.env` and fill in the Slack, Gemini, and GitHub values.
 3. Enable Socket Mode in your Slack app.
-   - Bot Token Scopes: `app_mentions:read`, `chat:write`, and `files:write` (for lookup table graphs).
-     To persist thread history across bot restarts, also add `channels:history` (and `groups:history` for private channels).
-   - Event Subscriptions: subscribe to `app_mention`. To allow users to reply directly in active bot threads without re-tagging `@bot`, also subscribe to `message.channels` and `message.groups`.
+   - Bot Token Scopes: `app_mentions:read`, `chat:write`, `channels:history` (for public channels), and `files:write` (for lookup table graphs).
+     *Note on channel types*: In Slack's API, public channels require `channels:history`, while private channels (lock icon 🔒) require `groups:history`. Direct messages (DMs) are governed by `im:history`.
+   - Event Subscriptions: subscribe to `app_mention`. To allow users to reply directly in active bot threads without re-tagging `@bot`, also subscribe to `message.channels` (and `message.groups` if using private channels).
    - App-level token needs `connections:write`. Invite the bot to the relevant channel.
 4. Start with `uv run --env-file .env main.py`.
 
@@ -34,17 +34,16 @@ in the next reply.
 
 ## Message chains and thread follow-ups
 
-When a user asks a question or replies in an existing thread, the bot possesses full
-conversation context across multiple turns (for example: *"Can you update the CAN IDs to 5 and 6?"*
-or *"Can you plot that table?"*).
+When a user asks a question or replies in an existing thread, the bot only uses context
+strictly from the specific thread it is in. Top-level channel questions start fresh with
+no prior context.
 
 The bot automatically:
-- Maintains an in-memory thread history cache (`ThreadHistoryCache`) and event deduplicator (`MessageDeduplicator`) so multi-turn conversations work immediately in live threads without double-processing.
-- Automatically handles thread replies even if the user replies in the thread without re-tagging `@bot` (when `message` events are subscribed).
-- Queries `conversations.replies` when `channels:history` / `groups:history` scopes are present, keeping thread history persistent across bot restarts.
-- Gracefully falls back to the in-memory cache if the Slack token lacks history scopes.
-- Informs the user with actionable instructions if earlier thread history cannot be loaded due to missing `channels:history` / `groups:history` scopes.
-- Filters out status messages and current turn timestamps.
+- Strictly scopes conversation context to the thread it is in: top-level channel questions never inherit history, and threads never cross-pollinate.
+- Queries `conversations.replies` for public channels via `channels:history`, keeping thread history persistent across bot restarts without needing group permissions.
+- Automatically handles thread replies even if the user replies directly in the thread without re-tagging `@bot` (when `message.channels` is subscribed).
+- Maintains a channel- and thread-scoped cache (`ThreadHistoryCache`) and event deduplicator (`MessageDeduplicator`) so multi-turn conversations work seamlessly without double-processing.
+- Filters out status messages, current turn timestamps, and third-party bot messages.
 - Cleans bot mentions and maps roles between user turns and assistant responses.
 - Normalizes turns to ensure valid alternating conversation flows for underlying LLMs.
 

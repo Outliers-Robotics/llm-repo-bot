@@ -5,6 +5,13 @@ import re
 from threading import Lock
 from time import monotonic
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    load_dotenv(".env.test")
+except Exception:
+    pass
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -97,15 +104,16 @@ def get_thread_history(
     thread_ts: str,
     current_ts: str,
     bot_user_id: str | None = None,
+    bot_id: str | None = None,
     logger: logging.Logger | None = None,
     limit: int | None = None,
 ) -> tuple[list[dict[str, str]], str | None]:
-    """Retrieve prior conversation messages from the Slack thread."""
+    """Retrieve prior conversation messages strictly from the specified Slack thread."""
     if limit is None:
         try:
-            limit = positive_int_env("SLACK_THREAD_HISTORY_LIMIT", 20)
+            limit = positive_int_env("SLACK_THREAD_HISTORY_LIMIT", 50)
         except Exception:
-            limit = 20
+            limit = 50
 
     error_code = None
     try:
@@ -121,18 +129,23 @@ def get_thread_history(
             return [], None
     except Exception as error:
         resp = getattr(error, "response", {})
-        if isinstance(resp, dict) and resp.get("error") == "missing_scope":
+        error_code = None
+        needed_scope = None
+        if hasattr(resp, "get"):
+            if resp.get("error") == "missing_scope":
+                error_code = "missing_scope"
+                needed_scope = resp.get("needed")
+        elif isinstance(resp, dict) and resp.get("error") == "missing_scope":
             error_code = "missing_scope"
-        elif hasattr(resp, "get") and resp.get("error") == "missing_scope":
-            error_code = "missing_scope"
-        else:
+            needed_scope = resp.get("needed")
+        if not error_code:
             error_code = "error"
         if logger:
             logger.warning(
                 "Could not fetch Slack thread history for channel=%s thread_ts=%s (error=%s): %s",
                 channel, thread_ts, error_code, error,
             )
-        return [], error_code
+        return [], needed_scope or error_code
 
     history: list[dict[str, str]] = []
     current_key = _ts_key(current_ts)
@@ -154,13 +167,28 @@ def get_thread_history(
         if not text or text.startswith("I'm looking into that"):
             continue
 
-        is_assistant = bool(
-            msg.get("bot_id")
-            or msg.get("subtype") == "bot_message"
-            or (bot_user_id and msg.get("user") == bot_user_id)
+        is_assistant = False
+        if bot_id and msg.get("bot_id") == bot_id:
+            is_assistant = True
+        elif bot_user_id and msg.get("user") == bot_user_id:
+            is_assistant = True
+        elif not bot_id and (msg.get("bot_id") or msg.get("subtype") == "bot_message"):
+            is_assistant = True
+
+        # Ignore messages from other bots (e.g. GitHub bot, CI) to prevent context pollution
+        is_other_bot = (
+            (msg.get("bot_id") and not is_assistant)
+            or (msg.get("subtype") == "bot_message" and not is_assistant)
         )
+        if is_other_bot:
+            continue
+
         if is_assistant:
-            history.append({"role": "assistant", "content": text})
+            # Strip previous system notices from assistant turns before sending to model
+            text = re.sub(r"\n\n_Note: I couldn't load earlier messages.*", "", text, flags=re.DOTALL).strip()
+            text = re.sub(r"\n\nI generated the graph, but Slack blocked the upload.*", "", text, flags=re.DOTALL).strip()
+            if text:
+                history.append({"role": "assistant", "content": text})
         else:
             cleaned = re.sub(r"<@[^>]+>", "", text).strip()
             if cleaned:
@@ -176,6 +204,7 @@ def handle_mention(
     logger,
     llm,
     bot_user_id: str | None = None,
+    bot_id: str | None = None,
     thread_cache: ThreadHistoryCache | None = None,
 ):
     if event.get("bot_id") or event.get("subtype") == "bot_message":
@@ -193,6 +222,7 @@ def handle_mention(
     ).strip()
 
     if not question:
+        logger.info("Ignoring event ts=%s: empty question after stripping bot mentions", event.get("ts"))
         return
 
     if thread_cache is None:
@@ -211,27 +241,40 @@ def handle_mention(
         logger.exception("Could not post the Slack status message")
 
     history: list[dict[str, str]] = []
-    missing_scope_notice = False
-    if event.get("thread_ts") and event["thread_ts"] != event["ts"]:
+    missing_scope_notice: str | None = None
+    is_thread = bool(event.get("thread_ts") and event["thread_ts"] != event["ts"])
+
+    if is_thread:
+        # Only use context in the thread it's in
+        cache_key = f"{event['channel']}:{event['thread_ts']}"
         slack_history, history_err = get_thread_history(
             client=client,
             channel=event["channel"],
             thread_ts=event["thread_ts"],
             current_ts=event["ts"],
             bot_user_id=bot_user_id,
+            bot_id=bot_id,
             logger=logger,
         )
         if slack_history:
             history = slack_history
-            thread_cache.set(event["thread_ts"], slack_history)
+            thread_cache.set(cache_key, slack_history)
         else:
-            cached_history = thread_cache.get(event["thread_ts"])
+            cached_history = thread_cache.get(cache_key)
             if cached_history:
                 history = cached_history
             else:
                 history = []
-                if history_err == "missing_scope":
-                    missing_scope_notice = True
+                if history_err in ("missing_scope", "channels:history", "groups:history") or (history_err and ":" in history_err):
+                    missing_scope_notice = history_err
+    else:
+        # Top-level question (not in a thread): strictly empty history so it never uses outside context
+        history = []
+
+    logger.info(
+        "Handling question ts=%s is_thread=%s thread_ts=%s history_turns=%d: %r",
+        event.get("ts"), is_thread, thread_ts, len(history), question,
+    )
 
     model_succeeded = False
     try:
@@ -253,10 +296,11 @@ def handle_mention(
             "Please try again or ask a more specific question."
         )
 
-    # Store successful turns in the thread cache before appending error/scope notes
+    # Store successful turns in the thread cache (channel- and thread-scoped)
     if model_succeeded:
-        thread_cache.append(thread_ts, "user", question)
-        thread_cache.append(thread_ts, "assistant", answer)
+        cache_key = f"{event['channel']}:{thread_ts}"
+        thread_cache.append(cache_key, "user", question)
+        thread_cache.append(cache_key, "assistant", answer)
 
     # Upload to the existing thread before composing the final delivery status.
     # Failure to attach a graph must still leave the user with the text answer.
@@ -287,12 +331,22 @@ def handle_mention(
         answer += "\n\nI generated the graph, but its Slack upload failed. Please try again."
 
     if model_succeeded and missing_scope_notice and not history:
-        answer += (
-            "\n\n_Note: I couldn't load earlier messages in this thread because the Slack app "
-            "is missing the `channels:history` (and `groups:history` for private channels) bot scope. "
-            "Add these scopes under OAuth & Permissions in the Slack app settings and reinstall the app "
-            "to enable persistent conversation history across bot restarts._"
-        )
+        if missing_scope_notice == "groups:history":
+            answer += (
+                "\n\n_Note: I couldn't load earlier messages in this thread because this channel is private "
+                "and the Slack app is missing the `groups:history` bot scope. "
+                "(In Slack, `groups:history` is required for private channels, while `channels:history` is for public channels). "
+                "To enable thread memory, either add `groups:history` under OAuth & Permissions in the Slack app settings and reinstall the app, "
+                "or use a public channel._"
+            )
+        else:
+            scope_needed = "channels:history" if missing_scope_notice == "missing_scope" else missing_scope_notice
+            answer += (
+                f"\n\n_Note: I couldn't load earlier messages in this thread because the Slack app "
+                f"is missing the `{scope_needed}` bot scope. "
+                f"Add `{scope_needed}` under OAuth & Permissions in the Slack app settings and reinstall the app "
+                f"to enable conversation history in public channels._"
+            )
 
     try:
         messages = split_markdown(answer)
@@ -326,37 +380,75 @@ def create_app(token_verification_enabled: bool = True):
     )
     llm = get_llm()
 
+    bot_user_id = None
+    bot_id = None
+    if token_verification_enabled:
+        try:
+            auth_info = app.client.auth_test()
+            bot_user_id = auth_info.get("user_id")
+            bot_id = auth_info.get("bot_id")
+            logging.getLogger(__name__).info(
+                "Bot connected to Slack as user_id=%s bot_id=%s", bot_user_id, bot_id,
+            )
+        except Exception as e:
+            logging.getLogger(__name__).warning("Could not resolve bot info on startup: %s", e)
+
     @app.event("app_mention")
     def mention_listener(event, say, client, logger, context=None):
+        logger.info(
+            "app_mention received: channel=%s ts=%s thread_ts=%s user=%s text=%r",
+            event.get("channel"), event.get("ts"), event.get("thread_ts"), event.get("user"), event.get("text"),
+        )
         msg_id = f"{event.get('channel')}:{event.get('ts')}"
         if not DEDUPLICATOR.acquire(msg_id):
+            logger.info("Ignoring duplicate event for %s", msg_id)
             return
-        bot_user_id = None
-        if context:
-            bot_user_id = getattr(context, "bot_user_id", None) or (
+        resolved_bot_user_id = bot_user_id
+        if resolved_bot_user_id is None and context:
+            resolved_bot_user_id = getattr(context, "bot_user_id", None) or (
                 context.get("bot_user_id") if isinstance(context, dict) else None
             )
-        handle_mention(event, say, client, logger, llm, bot_user_id=bot_user_id)
+        handle_mention(event, say, client, logger, llm, bot_user_id=resolved_bot_user_id, bot_id=bot_id)
 
     @app.event("message")
     def message_listener(event, say, client, logger, context=None):
         # Ignore bot messages and non-standard message subtypes (e.g. edits, deletes, joins)
-        if event.get("bot_id") or event.get("subtype"):
+        subtype = event.get("subtype")
+        if event.get("bot_id") or (subtype and subtype != "thread_broadcast"):
             return
 
-        bot_user_id = None
-        if context:
-            bot_user_id = getattr(context, "bot_user_id", None) or (
+        resolved_bot_user_id = bot_user_id
+        if resolved_bot_user_id is None and context:
+            resolved_bot_user_id = getattr(context, "bot_user_id", None) or (
                 context.get("bot_user_id") if isinstance(context, dict) else None
             )
-        if bot_user_id and event.get("user") == bot_user_id:
+        if resolved_bot_user_id and event.get("user") == resolved_bot_user_id:
             return
 
         thread_ts = event.get("thread_ts")
-        # Only handle thread replies in threads the bot is already participating in
+        # Only handle thread replies (never unmentioned top-level channel messages)
         if not thread_ts or thread_ts == event.get("ts"):
             return
-        if not THREAD_HISTORY_CACHE.has(thread_ts):
+
+        # Check if the bot is a participant in this thread
+        cache_key = f"{event.get('channel')}:{thread_ts}"
+        is_active = THREAD_HISTORY_CACHE.has(cache_key)
+        if not is_active:
+            # Check if Slack thread history has any prior bot replies
+            history, _ = get_thread_history(
+                client=client,
+                channel=event["channel"],
+                thread_ts=thread_ts,
+                current_ts=event.get("ts", ""),
+                bot_user_id=resolved_bot_user_id,
+                bot_id=bot_id,
+                logger=logger,
+            )
+            if any(m.get("role") == "assistant" for m in history):
+                is_active = True
+                THREAD_HISTORY_CACHE.set(cache_key, history)
+
+        if not is_active:
             return
 
         if not event.get("text", "").strip():
@@ -364,9 +456,14 @@ def create_app(token_verification_enabled: bool = True):
 
         msg_id = f"{event.get('channel')}:{event.get('ts')}"
         if not DEDUPLICATOR.acquire(msg_id):
+            logger.info("Ignoring duplicate message event for %s", msg_id)
             return
 
-        handle_mention(event, say, client, logger, llm, bot_user_id=bot_user_id)
+        logger.info(
+            "message listener triggered for thread reply: channel=%s ts=%s thread_ts=%s user=%s",
+            event.get("channel"), event.get("ts"), thread_ts, event.get("user"),
+        )
+        handle_mention(event, say, client, logger, llm, bot_user_id=resolved_bot_user_id, bot_id=bot_id)
 
     return app
 
