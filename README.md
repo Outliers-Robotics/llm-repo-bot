@@ -78,7 +78,48 @@ A missing upload scope produces an explanation in the reply while preserving the
 - **Attachment Budget**: Each answer supports up to three graph attachments.
 - **Local Rendering**: Chart generation runs entirely locally inside the bot process; source data and coordinates are never sent to external chart APIs or cloud rendering services.
 
+## FRC Documentation, CTRE API, Game Manual, and WPILib Lookups
+
+The bot can look up online FIRST Robotics Competition technical documentation, vendor APIs, and competition rules:
+
+- **`search_frc_docs(query, source="all")`**:
+  Searches official FRC resources:
+  - **WPILib Docs** (`docs.wpilib.org`): Searches the full official Sphinx index for kinematics, PID, feedforward, command-based framework, simulation, and hardware wiring.
+  - **CTRE Phoenix 6 API** (`v6.docs.ctr-electronics.com`, `api.ctr-electronics.com`): Searches CTRE documentation for TalonFX, CANcoder, Pigeon2, Swerve API, CANivore, Motion Magic, and current limits.
+  - **FRC Game Manual** (`firstfrc.blob.core.windows.net`): Searches the official manual PDF itself (see below).
+  - **Chief Delphi** (`chiefdelphi.com`): Searches the premier FRC community knowledge base for rule questions, official Q&A rulings, and motor tuning discussions.
+  - **REV Robotics & PathPlanner** (`docs.revrobotics.com`, `pathplanner.dev`): SPARK MAX/Flex, REVLib, and autonomous trajectory generation.
+- **`read_frc_doc(url)`**:
+  Reads and extracts clean, readable text from any matching FRC documentation page, API reference, or Chief Delphi thread. A Game Manual URL ending in `#page=N` returns that page's text instead of the raw PDF.
+
+`source` accepts `all` (default), `wpilib`, `ctre`, `game_manual`, `chiefdelphi`, or `rev`. Narrowing the source avoids unnecessary fetches.
+
+### Game Manual search
+
+The [2026 Game Manual](https://firstfrc.blob.core.windows.net/frc2026/Manual/2026GameManual.pdf) is downloaded once, its text extracted, and split into entries keyed by rule ID (`G401`, `R501`, `I101`, `T201`, `E101`, `C301`) and by numbered subsection (`6.5 Scoring`). Rules are looked up exactly rather than guessed at, and the narrative sections stay searchable.
+
+- **`search_game_manual(query, max_results=5)`**:
+  Ranks manual entries for questions about legality, scoring, penalties, ROBOT size and weight, BUMPERS, allowed motors and electronics, inspection, and tournament procedure. A rule ID appearing in the query is resolved exactly and returned first. Results carry the rule ID, section, page number, a snippet, and a `#page=N` URL to cite.
+- **`read_game_manual_rule(rule_id)`**:
+  Returns one rule's complete text, section, page, and URL. Accepts `R103`, `r103`, or `rule R103`.
+- **`read_game_manual_page(page)`**:
+  Returns the full text of a single manual page plus the rule IDs it contains, for surrounding context.
+
+Every result reports the manual version (for example `TU22`), so answers can cite the exact revision they came from. Because *FIRST* revises the manual mid-season, the cached copy is refreshed once per day.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FRC_MANUAL_CACHE_DIR` | system temp dir | Where the parsed manual index is cached between restarts |
+| `FRC_MANUAL_CACHE_TTL_HOURS` | `24` | How long before the manual is re-downloaded and re-parsed |
+
+The first lookup after a cold start downloads and parses the PDF (~10 s); afterwards the index loads from disk in well under a second. If *FIRST* is unreachable, a previously cached copy is still served rather than losing the tool.
+
+### Internet Access Safeguards & Domain Whitelist
+Internet access is strictly restricted to approved FRC technical domains:
+`docs.wpilib.org`, `github.wpilib.org`, `v6.docs.ctr-electronics.com`, `api.ctr-electronics.com`, `chiefdelphi.com`, `firstinspires.org`, `frc-qa.firstinspires.org`, `docs.revrobotics.com`, `pathplanner.dev`, `docs.limelightvision.io`, `docs.photonvision.org`, `thebluealliance.com`, `firstfrc.blob.core.windows.net` (the Game Manual PDF), `choreo.autos`, and `advantagescope.org`. Any non-FRC domains are automatically blocked.
+
 ## Repository research
+
 
 Independent repository lookups in one model response run concurrently, with
 up to four workers per mention. Each answer allows up to four tool rounds and

@@ -20,6 +20,12 @@ from llm.factory import get_llm
 from prompts.system import SYSTEM_PROMPT
 from slack_messages import split_markdown
 from tools.github import search_repo, read_file
+from tools.frc_docs import search_frc_docs, read_frc_doc
+from tools.game_manual import (
+    read_game_manual_page,
+    read_game_manual_rule,
+    search_game_manual,
+)
 from tools.plots import PlotSession
 
 
@@ -281,7 +287,17 @@ def handle_mention(
         answer = llm.answer(
             question=question,
             system_prompt=SYSTEM_PROMPT,
-            tools=[search_repo, plots.read_file, plots.plot_lookup_tables, plots.plot_data],
+            tools=[
+                search_repo,
+                plots.read_file,
+                plots.plot_lookup_tables,
+                plots.plot_data,
+                search_frc_docs,
+                read_frc_doc,
+                search_game_manual,
+                read_game_manual_rule,
+                read_game_manual_page,
+            ],
             history=history,
         )
         if not isinstance(answer, str) or not answer.strip():

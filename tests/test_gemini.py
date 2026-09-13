@@ -443,6 +443,43 @@ class GeminiProviderTests(unittest.TestCase):
         declarations = [d["name"] for tool in self.requests[1]["tools"] for d in tool["functionDeclarations"]]
         self.assertEqual(declarations, ["plot_lookup_tables", "plot_data"])
 
+    def test_frc_docs_search_and_read_work_through_provider(self):
+        def search_frc_docs(query: str, source: str = "all") -> dict:
+            """Search FRC documentation."""
+            return {
+                "matches": [
+                    {
+                        "title": "TalonFX Current Limits",
+                        "url": "https://v6.docs.ctr-electronics.com/en/stable/docs/hardware/current-limits.html",
+                        "source": "CTRE Phoenix 6 Docs",
+                    }
+                ]
+            }
+
+        def read_frc_doc(url: str) -> dict:
+            """Read FRC documentation."""
+            return {
+                "title": "TalonFX Current Limits",
+                "url": url,
+                "content": "Stator current limiting limits motor torque to avoid overheating.",
+            }
+
+        self.responses.extend([
+            model_response(tool_call("search_frc_docs", query="TalonFX current limit")),
+            model_response(tool_call(
+                "read_frc_doc",
+                url="https://v6.docs.ctr-electronics.com/en/stable/docs/hardware/current-limits.html",
+            )),
+            model_response({"text": "CTRE recommends stator current limits to control motor torque."}),
+        ])
+        answer = self.provider.answer(
+            question="What is the difference between stator and supply current limits in CTRE?",
+            system_prompt="Use official FRC docs.",
+            tools=[search_frc_docs, read_frc_doc],
+        )
+        self.assertIn("CTRE recommends stator current limits", answer)
+        self.assertEqual(len(self.requests), 3)
+
     def test_history_is_passed_to_chat_session_as_model_and_user_turns(self):
         self.responses.append(model_response({"text": "The ratio is 6.75:1."}))
         answer = self.provider.answer(
