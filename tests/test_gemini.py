@@ -8,7 +8,9 @@ from unittest.mock import patch
 import httpx
 from google import genai
 
+from llm.base import normalize_history
 from llm.gemini import GeminiProvider, INCOMPLETE_ANSWER
+from tools.plots import PlotSession
 
 
 def model_response(*parts):
@@ -346,6 +348,174 @@ class GeminiProviderTests(unittest.TestCase):
         self.answer()
         self.answer()
         self.assertEqual(len(self.requests[1]["contents"]), 1)
+
+    def test_plot_tool_schema_and_read_then_render_work_through_real_sdk(self):
+        session = PlotSession(lambda path: {
+            "content": "double offset = 30; auto flyMap = {{1, 1200 + offset}, {2, 1300 + offset}};",
+            "url": "https://github.com/team/robot/blob/main/Shot.cpp",
+        })
+        self.responses.extend([
+            model_response(tool_call("read_file", path="Shot.cpp")),
+            model_response(tool_call(
+                "plot_lookup_tables", title="RPM table", x_label="Distance (m)",
+                y_label="Speed (RPM)", paths=["Shot.cpp"], tables=["flyMap"], labels=["Flywheel"],
+            )),
+            model_response({"text": "The graph shows the configured RPM."}),
+        ])
+        self.assertIn("configured RPM", self.answer(tools=[session.read_file, session.plot_lookup_tables]))
+        self.assertEqual(len(session.artifacts), 1)
+        result = self.requests[2]["contents"][-1]["parts"][0]["functionResponse"]["response"]["result"]
+        self.assertEqual(result["series"][0]["points"], [[1, 1230], [2, 1330]])
+        self.assertNotIn("png", result)  # Binary images never enter the model context.
+
+    def test_graph_gets_local_render_turn_after_repository_round_budget(self):
+        self.provider.max_tool_rounds = 1
+        session = PlotSession(lambda path: {"content": "auto flyMap = {{1, 1200}, {2, 1300}};"})
+        self.responses.extend([
+            model_response(tool_call("read_file", path="Shot.cpp")),
+            model_response(tool_call(
+                "plot_lookup_tables", title="RPM table", x_label="Distance (m)",
+                y_label="Speed (RPM)", paths=["Shot.cpp"], tables=["flyMap"], labels=["Flywheel"],
+            )),
+            model_response({"text": "The graph is ready."}),
+        ])
+        self.assertEqual(self.provider.answer(
+            question="Graph the flywheel RPM table", system_prompt="Use source.",
+            tools=[session.read_file, session.plot_lookup_tables],
+        ), "The graph is ready.")
+        declarations = [d["name"] for tool in self.requests[1]["tools"] for d in tool["functionDeclarations"]]
+        self.assertEqual(declarations, ["plot_lookup_tables"])
+        self.assertNotIn("tools", self.requests[-1])
+        evidence = json.loads(self.requests[-1]["contents"][0]["parts"][0]["text"])["repository_lookups"]
+        self.assertEqual(evidence[-1]["result"]["status"], "graph_ready")
+
+    def test_non_graph_answer_does_not_get_extra_render_turn(self):
+        self.provider.max_tool_rounds = 1
+        session = PlotSession(lambda path: {"content": "source"})
+        self.responses.extend([
+            model_response(tool_call("read_file", path="Shot.cpp")),
+            model_response({"text": "Text answer."}),
+        ])
+        self.assertEqual(self.answer(tools=[session.read_file, session.plot_lookup_tables]), "Text answer.")
+        self.assertEqual(len(self.requests), 2)
+        self.assertNotIn("tools", self.requests[-1])
+
+
+    def test_history_is_passed_to_chat_session_as_model_and_user_turns(self):
+        self.responses.append(model_response({"text": "The ratio is 6.75:1."}))
+        answer = self.provider.answer(
+            question="What gear ratio?",
+            system_prompt="Use repository evidence.",
+            tools=[lookup],
+            history=[
+                {"role": "user", "content": "Explain drive"},
+                {"role": "assistant", "content": "Drive uses 4 swerve modules."},
+            ],
+        )
+        self.assertEqual(answer, "The ratio is 6.75:1.")
+        self.assertEqual(len(self.requests), 1)
+        contents = self.requests[0]["contents"]
+        self.assertEqual(len(contents), 3)
+        self.assertEqual(contents[0]["role"], "user")
+        self.assertEqual(contents[0]["parts"][0]["text"], "Explain drive")
+        self.assertEqual(contents[1]["role"], "model")
+        self.assertEqual(contents[1]["parts"][0]["text"], "Drive uses 4 swerve modules.")
+        self.assertEqual(contents[2]["role"], "user")
+        self.assertEqual(contents[2]["parts"][0]["text"], "What gear ratio?")
+
+    def test_history_is_included_in_final_synthesis(self):
+        self.provider.max_tool_rounds = 1
+        self.responses.extend([
+            model_response(tool_call("lookup", path="Drive.cpp")),
+            model_response({"text": "Drive synthesis answer."}),
+        ])
+        history = [
+            {"role": "user", "content": "Explain drive"},
+            {"role": "assistant", "content": "Drive uses 4 swerve modules."},
+        ]
+        answer = self.provider.answer(
+            question="What gear ratio?",
+            system_prompt="Use repository evidence.",
+            tools=[lookup],
+            history=history,
+        )
+        self.assertEqual(answer, "Drive synthesis answer.")
+        self.assertEqual(len(self.requests), 2)
+        final_request = self.requests[-1]
+        payload = json.loads(final_request["contents"][0]["parts"][0]["text"])
+        self.assertEqual(payload["question"], "What gear ratio?")
+        self.assertEqual(payload["conversation_history"], history)
+
+
+class NormalizeHistoryTests(unittest.TestCase):
+    def test_empty_or_none_history_returns_empty_list_and_original_question(self):
+        for empty in (None, [], [{"role": "user", "content": "  "}]):
+            with self.subTest(empty=empty):
+                hist, q = normalize_history(empty, "What is drive?")
+                self.assertEqual(hist, [])
+                self.assertEqual(q, "What is drive?")
+
+    def test_consecutive_messages_with_same_role_are_merged(self):
+        history = [
+            {"role": "user", "content": "Hello"},
+            {"role": "user", "content": "How does shooter work?"},
+            {"role": "assistant", "content": "Part 1"},
+            {"role": "assistant", "content": "Part 2"},
+        ]
+        hist, q = normalize_history(history, "What is the speed?")
+        self.assertEqual(hist, [
+            {"role": "user", "content": "Hello\n\nHow does shooter work?"},
+            {"role": "assistant", "content": "Part 1\n\nPart 2"},
+        ])
+        self.assertEqual(q, "What is the speed?")
+
+    def test_trailing_user_message_is_prepended_to_question(self):
+        history = [
+            {"role": "user", "content": "Question 1"},
+            {"role": "assistant", "content": "Answer 1"},
+            {"role": "user", "content": "Question 2 with no reply"},
+        ]
+        hist, q = normalize_history(history, "Current question")
+        self.assertEqual(hist, [
+            {"role": "user", "content": "Question 1"},
+            {"role": "assistant", "content": "Answer 1"},
+        ])
+        self.assertEqual(q, "Question 2 with no reply\n\nCurrent question")
+
+    def test_only_user_messages_in_history_are_folded_into_question(self):
+        history = [
+            {"role": "user", "content": "Context comment 1"},
+            {"role": "user", "content": "Context comment 2"},
+        ]
+        hist, q = normalize_history(history, "Current question")
+        self.assertEqual(hist, [])
+        self.assertEqual(q, "Context comment 1\n\nContext comment 2\n\nCurrent question")
+
+    def test_leading_assistant_message_context_is_preserved(self):
+        history = [
+            {"role": "assistant", "content": "Announcement: Code updated"},
+            {"role": "user", "content": "What changed?"},
+            {"role": "assistant", "content": "Shooter updated."},
+        ]
+        hist, q = normalize_history(history, "What is the speed?")
+        self.assertEqual(hist[0]["role"], "user")
+        self.assertIn("Announcement: Code updated", hist[0]["content"])
+        self.assertIn("What changed?", hist[0]["content"])
+        self.assertEqual(hist[1]["role"], "assistant")
+        self.assertEqual(hist[1]["content"], "Shooter updated.")
+
+    def test_max_history_turns_truncates_older_turns_cleanly(self):
+        history = []
+        for i in range(15):
+            history.extend([
+                {"role": "user", "content": f"Q{i}"},
+                {"role": "assistant", "content": f"A{i}"},
+            ])
+        hist, q = normalize_history(history, "Latest question", max_history_turns=6)
+        self.assertEqual(len(hist), 6)
+        self.assertEqual(hist[0]["role"], "user")
+        self.assertEqual(hist[-1]["role"], "assistant")
+        self.assertEqual(hist[-1]["content"], "A14")
 
 
 if __name__ == "__main__":

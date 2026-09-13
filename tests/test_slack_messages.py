@@ -1,9 +1,40 @@
 import unittest
 
-from slack_messages import MAX_MARKDOWN_LENGTH, split_markdown
+from slack_messages import MAX_MARKDOWN_LENGTH, format_math_for_slack, split_markdown
 
 
 class SlackMarkdownTests(unittest.TestCase):
+    def test_latex_math_is_converted_to_readable_slack_format(self):
+        cases = [
+            ("Distance ($m$)", "Distance (m)"),
+            (r"Speed ($\text{RPM}$)", "Speed (RPM)"),
+            (r"RPM: $1255\text{ RPM}$", "RPM: 1255 RPM"),
+            (r"Range: $1.34\text{ m} \le d \le 5.60\text{ m}$", "Range: 1.34 m ≤ d ≤ 5.60 m"),
+            (r"Values: $x \ge 0$ and $y \approx 10$", "Values: x ≥ 0 and y ≈ 10"),
+            (r"Angle: $45^\circ$", "Angle: 45°"),
+            (r"Acceleration: $9.8\text{ m/s}^2$", "Acceleration: 9.8 m/s²"),
+            (r"Fraction: $\frac{a + b}{c}$", "Fraction: (a + b) / c"),
+            (r"Display: $$y = mx + b$$", "Display: y = mx + b"),
+            (r"Bracket: \[v = \sqrt{x}\]", "Bracket: v = √(x)"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(format_math_for_slack(raw), expected)
+
+    def test_math_cleaning_preserves_code_blocks_and_spans(self):
+        text = (
+            "Formula $x = 1$ in text.\n\n"
+            "```cpp\n"
+            "// do not touch $foo or \\text in code\n"
+            "double $val = 10;\n"
+            "```\n\n"
+            "Inline `$code$` preserved."
+        )
+        cleaned = format_math_for_slack(text)
+        self.assertIn("Formula x = 1 in text.", cleaned)
+        self.assertIn("double $val = 10;", cleaned)
+        self.assertIn("`$code$`", cleaned)
+
     def test_markdown_and_cpp_are_preserved_for_native_slack_rendering(self):
         answer = (
             "### Current limits\n\n"

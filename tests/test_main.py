@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 from slack_bolt.context.say import Say
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 from main import handle_mention
 
@@ -124,6 +125,91 @@ class MentionTests(unittest.TestCase):
                 self.say.assert_not_called()
                 self.llm.answer.assert_not_called()
                 self.event = original
+
+    def _answer_with_graph(self, **kwargs):
+        functions = {tool.__name__: tool for tool in kwargs["tools"]}
+        functions["read_file"]("Shot.cpp")
+        result = functions["plot_lookup_tables"](
+            title="RPM table", x_label="Distance (m)", y_label="Speed (RPM)",
+            paths=["Shot.cpp"], tables=["flyMap"], labels=["Flywheel"],
+        )
+        self.assertEqual(result["status"], "graph_ready")
+        return "The graph shows the configured RPM table."
+
+    def _graph_source(self):
+        return patch("main.read_file", return_value={
+            "content": "auto flyMap = {{1, 1200}, {2, 1300}};",
+            "url": "https://github.com/team/robot/blob/main/Shot.cpp",
+        })
+
+    def test_graph_is_uploaded_as_png_in_the_existing_thread(self):
+        self.event["thread_ts"] = "0.5"
+        self.llm.answer.side_effect = self._answer_with_graph
+        with self._graph_source():
+            self.handle()
+        upload = self.client.files_upload_v2.call_args.kwargs
+        self.assertEqual(upload["channel"], "C1")
+        self.assertEqual(upload["thread_ts"], "0.5")
+        self.assertTrue(upload["file"].startswith(b"\x89PNG"))
+        self.assertEqual(upload["filename"], "lookup-tables-1.png")
+        self.assertIn("Flywheel: 2 points", upload["alt_txt"])
+        self.assertIn("configured RPM", self.client.chat_update.call_args.kwargs["markdown_text"])
+
+    def test_graph_upload_failure_preserves_text_and_explains_missing_scope(self):
+        self.llm.answer.side_effect = self._answer_with_graph
+        self.client.files_upload_v2.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})
+        with self._graph_source():
+            self.handle()
+        answer = self.client.chat_update.call_args.kwargs["markdown_text"]
+        self.assertIn("configured RPM", answer)
+        self.assertIn("files:write", answer)
+        self.assertIn("reinstall", answer)
+
+    def test_other_upload_failure_is_reported_and_does_not_escape_listener(self):
+        self.llm.answer.side_effect = self._answer_with_graph
+        self.client.files_upload_v2.side_effect = TimeoutError("Slack timed out")
+        with self._graph_source():
+            self.handle()
+        answer = self.client.chat_update.call_args.kwargs["markdown_text"]
+        self.assertIn("configured RPM", answer)
+        self.assertIn("upload failed", answer)
+
+    def test_text_only_answer_does_not_upload_any_files(self):
+        self.handle()
+        self.client.files_upload_v2.assert_not_called()
+
+    def test_thread_history_is_fetched_and_forwarded_to_model(self):
+        self.event = {"text": "<@BOT> What gear ratio?", "ts": "2.0", "thread_ts": "1.0", "channel": "C1"}
+        self.client.conversations_replies.return_value = {
+            "ok": True,
+            "messages": [
+                {"ts": "1.0", "user": "U123", "text": "<@BOT> Explain drive"},
+                {"ts": "1.1", "bot_id": "B123", "text": "I'm looking into that…"},
+                {"ts": "1.1", "bot_id": "B123", "text": "Drive uses 4 swerve modules."},
+                {"ts": "2.0", "user": "U123", "text": "<@BOT> What gear ratio?"},
+            ],
+        }
+        self.handle()
+        self.client.conversations_replies.assert_called_once_with(channel="C1", ts="1.0", limit=20)
+        call_kwargs = self.llm.answer.call_args.kwargs
+        self.assertEqual(call_kwargs["question"], "What gear ratio?")
+        self.assertEqual(call_kwargs["history"], [
+            {"role": "user", "content": "Explain drive"},
+            {"role": "assistant", "content": "Drive uses 4 swerve modules."},
+        ])
+
+    def test_thread_history_failure_falls_back_to_empty_history(self):
+        self.event["thread_ts"] = "0.5"
+        self.client.conversations_replies.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})
+        self.handle()
+        self.assertEqual(self.llm.answer.call_args.kwargs["history"], [])
+        self.logger.warning.assert_called()
+        self.assertIn("The drivetrain moves the robot.", self.client.chat_update.call_args.kwargs["markdown_text"])
+
+    def test_top_level_mention_does_not_call_conversations_replies(self):
+        self.handle()
+        self.client.conversations_replies.assert_not_called()
+        self.assertEqual(self.llm.answer.call_args.kwargs["history"], [])
 
 
 if __name__ == "__main__":
