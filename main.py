@@ -8,6 +8,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from llm.factory import get_llm
 from prompts.system import SYSTEM_PROMPT
+from slack_messages import split_markdown
 from tools.github import search_repo, read_file
 
 TOOLS = [
@@ -58,17 +59,21 @@ def handle_mention(event, say, client, logger, llm):
         )
 
     try:
+        messages = split_markdown(answer)
         if pending is not None:
             try:
                 client.chat_update(
                     channel=event["channel"],
                     ts=pending["ts"],
-                    text=answer,
+                    markdown_text=messages[0],
                 )
-                return
+                messages = messages[1:]
             except Exception:
                 logger.exception("Could not update Slack status; posting the answer separately")
-        say(text=answer, thread_ts=thread_ts)
+        for message in messages:
+            # The dictionary form avoids Say's default text="", which conflicts
+            # with markdown_text. Use the same formatting for every delivery path.
+            say({"markdown_text": message}, thread_ts=thread_ts)
     except Exception:
         logger.exception("Could not deliver the Slack answer ts=%s", event["ts"])
     finally:

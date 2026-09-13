@@ -22,6 +22,12 @@ then updates that message with the answer or an error. If the update fails,
 it tries posting the final answer as another reply in the same thread. Bolt
 acknowledges mention events before running the listener in its worker pool.
 
+Answers use Slack's native `markdown_text` field for headings, bold labels,
+lists, tables, clickable source links, and fenced C++ code. The same formatting
+is used when updating the status and when posting fallback replies. Answers
+over Slack's 12,000-character Markdown limit are split into thread replies at
+paragraph or line boundaries, with fenced code continued in the next reply.
+
 Independent repository lookups in one model response run concurrently, with
 up to four workers per mention. Each answer allows up to four tool rounds and
 twelve distinct tool calls. Identical lookups reuse their results within a
