@@ -5,11 +5,13 @@ from slack_bolt.context.say import Say
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from main import handle_mention
+from main import handle_mention, THREAD_HISTORY_CACHE, DEDUPLICATOR, create_app
 
 
 class MentionTests(unittest.TestCase):
     def setUp(self):
+        THREAD_HISTORY_CACHE.clear()
+        DEDUPLICATOR.clear()
         self.event = {"text": "<@BOT> Explain drive", "ts": "1.0", "channel": "C1"}
         self.say = Mock(return_value={"ts": "2.0"})
         self.client = Mock()
@@ -210,6 +212,136 @@ class MentionTests(unittest.TestCase):
         self.handle()
         self.client.conversations_replies.assert_not_called()
         self.assertEqual(self.llm.answer.call_args.kwargs["history"], [])
+
+    def test_thread_history_falls_back_to_cache_when_slack_scope_missing(self):
+        # Turn 1: Top-level question answered and cached
+        self.event = {"text": "<@BOT> Write a drive command", "ts": "1.0", "channel": "C1"}
+        self.llm.answer.return_value = "Here is SwerveDriveCommand.cpp"
+        self.handle()
+        self.assertTrue(THREAD_HISTORY_CACHE.has("1.0"))
+
+        # Turn 2: Follow-up question in the same thread
+        self.event = {"text": "<@BOT> Can you update the CAN IDs?", "ts": "2.0", "thread_ts": "1.0", "channel": "C1"}
+        self.llm.answer.return_value = "Updated CAN IDs to 5 and 6."
+        self.client.conversations_replies.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})
+        self.say.reset_mock()
+        self.client.chat_update.reset_mock()
+
+        self.handle()
+        self.client.conversations_replies.assert_called_once_with(channel="C1", ts="1.0", limit=20)
+        call_kwargs = self.llm.answer.call_args.kwargs
+        self.assertEqual(call_kwargs["question"], "Can you update the CAN IDs?")
+        self.assertEqual(call_kwargs["history"], [
+            {"role": "user", "content": "Write a drive command"},
+            {"role": "assistant", "content": "Here is SwerveDriveCommand.cpp"},
+        ])
+        # Since cache provided history, no missing scope warning is appended
+        answer_text = self.client.chat_update.call_args.kwargs["markdown_text"]
+        self.assertEqual(answer_text, "Updated CAN IDs to 5 and 6.")
+
+    def test_thread_history_missing_scope_with_empty_cache_warns_user(self):
+        # Turn in an uncached thread when Slack API fails with missing_scope
+        self.event = {"text": "<@BOT> Follow up", "ts": "2.0", "thread_ts": "1.0", "channel": "C1"}
+        self.client.conversations_replies.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})
+        self.handle()
+        answer_text = self.client.chat_update.call_args.kwargs["markdown_text"]
+        self.assertIn("channels:history", answer_text)
+        self.assertIn("groups:history", answer_text)
+
+    def test_message_listener_handles_thread_reply_in_cached_thread_without_bot_mention(self):
+        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "GEMINI_API_KEY": "test-key"}):
+            app = create_app(token_verification_enabled=False)
+
+        listeners = {l.ack_function.__name__: l.ack_function for l in app._listeners}
+        message_listener = listeners["message_listener"]
+
+        self.assertIsNotNone(message_listener)
+
+        # Pre-populate cache for thread 1.0
+        THREAD_HISTORY_CACHE.append("1.0", "user", "Explain drive")
+        THREAD_HISTORY_CACHE.append("1.0", "assistant", "Drive uses 4 swerve modules.")
+
+        # User replies in thread 1.0 WITHOUT @mention
+        reply_event = {
+            "text": "What motors does it use?",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+            "channel": "C1",
+            "user": "U999",
+        }
+        mock_say = Mock(return_value={"ts": "2.1"})
+        mock_client = Mock()
+        mock_client.conversations_replies.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})
+        mock_logger = Mock()
+
+        message_listener(
+            event=reply_event,
+            say=mock_say,
+            client=mock_client,
+            logger=mock_logger,
+            context={"bot_user_id": "B_BOT"},
+        )
+
+        # Confirm the reply was processed and answered in the thread
+        mock_client.chat_update.assert_called_once()
+        self.assertEqual(mock_say.call_args_list[0].kwargs["thread_ts"], "1.0")
+
+    def test_message_listener_ignores_uncached_threads_and_top_level_messages(self):
+        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "GEMINI_API_KEY": "test-key"}):
+            app = create_app(token_verification_enabled=False)
+
+        listeners = {l.ack_function.__name__: l.ack_function for l in app._listeners}
+        message_listener = listeners["message_listener"]
+        mock_say = Mock()
+        mock_client = Mock()
+        mock_logger = Mock()
+
+        # 1. Top-level message without mention -> ignored
+        top_event = {"text": "hello team", "ts": "5.0", "channel": "C1", "user": "U999"}
+        message_listener(event=top_event, say=mock_say, client=mock_client, logger=mock_logger)
+        mock_say.assert_not_called()
+
+        # 2. Reply in uncached thread -> ignored
+        uncached_event = {"text": "random thread chatter", "ts": "6.0", "thread_ts": "5.0", "channel": "C1", "user": "U999"}
+        message_listener(event=uncached_event, say=mock_say, client=mock_client, logger=mock_logger)
+        mock_say.assert_not_called()
+
+        # 3. Message from bot itself -> ignored
+        bot_event = {"text": "bot talking", "ts": "7.0", "thread_ts": "1.0", "channel": "C1", "bot_id": "B1"}
+        message_listener(event=bot_event, say=mock_say, client=mock_client, logger=mock_logger)
+        mock_say.assert_not_called()
+
+    def test_deduplication_prevents_duplicate_processing(self):
+        with patch.dict("os.environ", {"SLACK_BOT_TOKEN": "xoxb-test", "GEMINI_API_KEY": "test-key"}):
+            app = create_app(token_verification_enabled=False)
+
+        listeners = {l.ack_function.__name__: l.ack_function for l in app._listeners}
+        mention_listener = listeners["mention_listener"]
+        message_listener = listeners["message_listener"]
+
+        THREAD_HISTORY_CACHE.append("1.0", "user", "Explain drive")
+        THREAD_HISTORY_CACHE.append("1.0", "assistant", "Drive uses 4 swerve modules.")
+
+        event = {
+            "text": "<@B_BOT> Can we adjust speed?",
+            "ts": "2.0",
+            "thread_ts": "1.0",
+            "channel": "C1",
+            "user": "U999",
+        }
+        mock_say = Mock(return_value={"ts": "2.1"})
+        mock_client = Mock()
+        mock_client.conversations_replies.side_effect = SlackApiError("missing scope", {"error": "missing_scope"})
+        mock_logger = Mock()
+
+        # First handler runs (app_mention)
+        mention_listener(event=event, say=mock_say, client=mock_client, logger=mock_logger, context={"bot_user_id": "B_BOT"})
+        self.assertEqual(mock_client.chat_update.call_count, 1)
+
+        # Second handler runs (message) for the same event
+        message_listener(event=event, say=mock_say, client=mock_client, logger=mock_logger, context={"bot_user_id": "B_BOT"})
+        # Should NOT have executed a second time!
+        self.assertEqual(mock_client.chat_update.call_count, 1)
 
 
 if __name__ == "__main__":

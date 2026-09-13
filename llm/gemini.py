@@ -172,21 +172,22 @@ class GeminiChatSession(ProviderSession):
         results: list[dict],
         system_prompt: str,
     ) -> ModelTurn:
-        message = [
-            types.Part(function_response=types.FunctionResponse(
-                name=call.name or "unknown",
-                id=call.call_id,
-                response=result,
-            ))
-            for call, result in zip(calls, results)
-        ]
+        if calls and results:
+            message = [
+                types.Part(function_response=types.FunctionResponse(
+                    name=call.name or "unknown",
+                    id=call.call_id,
+                    response=result,
+                ))
+                for call, result in zip(calls, results)
+            ]
+        else:
+            message = (
+                "Repository research is complete. If the source supports the "
+                "requested graph, call plot_lookup_tables now."
+            )
         plot_config = self.base_config.model_copy(update={
             "tools": [self.function_map["plot_lookup_tables"]],
-            "tool_config": types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(
-                    mode="AUTO", allowed_function_names=["plot_lookup_tables"],
-                ),
-            ),
             "system_instruction": system_prompt + GRAPH_TURN_INSTRUCTION,
         })
         started = monotonic()

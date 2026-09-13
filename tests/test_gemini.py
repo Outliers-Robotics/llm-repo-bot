@@ -400,6 +400,24 @@ class GeminiProviderTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 2)
         self.assertNotIn("tools", self.requests[-1])
 
+    def test_graph_request_triggers_render_turn_even_if_model_returns_text_after_read(self):
+        session = PlotSession(lambda path: {"content": "auto flyMap = {{1, 1200}, {2, 1300}};"})
+        self.responses.extend([
+            model_response(tool_call("read_file", path="Shot.cpp")),
+            model_response({"text": "I read the file and found the tables."}),
+            model_response(tool_call(
+                "plot_lookup_tables", title="RPM table", x_label="Distance (m)",
+                y_label="Speed (RPM)", paths=["Shot.cpp"], tables=["flyMap"], labels=["Flywheel"],
+            )),
+            model_response({"text": "The graph has been generated."}),
+        ])
+        answer = self.provider.answer(
+            question="Plot the flywheel RPM table", system_prompt="Use source.",
+            tools=[session.read_file, session.plot_lookup_tables],
+        )
+        self.assertIn("The graph has been generated.", answer)
+        self.assertEqual(len(session.artifacts), 1)
+        self.assertEqual(session.artifacts[0].filename, "lookup-tables-1.png")
 
     def test_history_is_passed_to_chat_session_as_model_and_user_turns(self):
         self.responses.append(model_response({"text": "The ratio is 6.75:1."}))

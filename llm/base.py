@@ -295,6 +295,9 @@ class BaseResearchProvider(LLMProvider):
                 last_turn = turn
 
                 if not turn.has_tool_calls:
+                    if should_take_graph_turn(question, evidence, function_map):
+                        self.logger.info("Model returned text; taking dedicated graph turn")
+                        break
                     return turn.text or INCOMPLETE_ANSWER
 
                 calls = turn.tool_calls
